@@ -2,6 +2,7 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { QuoteRaw, ProcessedQuote, FilterState } from './types';
 import { DEFAULT_QUOTES } from './data/defaultQuotes';
 import { processQuotes } from './utils/calculations';
+import { supabase, isSupabaseConfigured } from './lib/supabaseClient';
 import { Header } from './components/Header';
 import { DashboardCards } from './components/DashboardCards';
 import { FilterBar } from './components/FilterBar';
@@ -9,10 +10,16 @@ import { QuoteTable } from './components/QuoteTable';
 import { PrComparisonModal } from './components/PrComparisonModal';
 import { QuoteFormModal } from './components/QuoteFormModal';
 import { ImportModal } from './components/ImportModal';
+import { AuthModal } from './components/AuthModal';
+import { Cloud, Loader2 } from 'lucide-react';
 
 const STORAGE_KEY = 'exs02.quotes.v1';
 
 export default function App() {
+  const [session, setSession] = useState<any>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [syncing, setSyncing] = useState(false);
+
   const [rawQuotes, setRawQuotes] = useState<QuoteRaw[]>(() => {
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
@@ -43,7 +50,56 @@ export default function App() {
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
 
-  // Save to localStorage whenever rawQuotes changes
+  // 1. Supabase Auth state observer
+  useEffect(() => {
+    if (!isSupabaseConfigured) {
+      setAuthLoading(false);
+      return;
+    }
+
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setSession(session);
+      setAuthLoading(false);
+      if (session) {
+        fetchQuotesFromSupabase();
+      }
+    });
+
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      setSession(session);
+      if (session) {
+        fetchQuotesFromSupabase();
+      }
+    });
+
+    return () => subscription.unsubscribe();
+  }, []);
+
+  // Fetch quotes from Supabase database
+  const fetchQuotesFromSupabase = async () => {
+    if (!isSupabaseConfigured) return;
+    try {
+      setSyncing(true);
+      const { data, error } = await supabase
+        .from('quotes')
+        .select('*')
+        .order('quote_id', { ascending: true });
+
+      if (error) {
+        console.error('Error fetching quotes from Supabase:', error);
+      } else if (data && data.length > 0) {
+        setRawQuotes(data);
+      }
+    } catch (err) {
+      console.error('Supabase fetch exception:', err);
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  // Save to localStorage & Supabase
   useEffect(() => {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(rawQuotes));
@@ -51,6 +107,25 @@ export default function App() {
       console.error('Failed to save to localStorage', e);
     }
   }, [rawQuotes]);
+
+  // Upsert data to Supabase cumulatively
+  const saveToSupabaseCumulative = async (quotesToSave: QuoteRaw[]) => {
+    if (!isSupabaseConfigured || !session) return;
+    try {
+      setSyncing(true);
+      const { error } = await supabase
+        .from('quotes')
+        .upsert(quotesToSave, { onConflict: 'quote_id' });
+
+      if (error) {
+        console.error('Error upserting quotes to Supabase:', error);
+      }
+    } catch (err) {
+      console.error('Supabase upsert exception:', err);
+    } finally {
+      setSyncing(false);
+    }
+  };
 
   // Process all quotes with business logic
   const processedQuotes = useMemo(() => {
@@ -70,7 +145,6 @@ export default function App() {
   const filteredQuotes = useMemo(() => {
     let list = [...processedQuotes];
 
-    // Search query
     if (filter.searchQuery.trim()) {
       const q = filter.searchQuery.toLowerCase();
       list = list.filter(item =>
@@ -82,12 +156,10 @@ export default function App() {
       );
     }
 
-    // Status filter
     if (filter.statusFilter !== 'ALL') {
       list = list.filter(item => item.status === filter.statusFilter);
     }
 
-    // Judgment filter
     if (filter.judgmentFilter !== 'ALL') {
       if (filter.judgmentFilter === '지연') {
         list = list.filter(item => item.deliveryState === '지연');
@@ -104,17 +176,14 @@ export default function App() {
       }
     }
 
-    // Item filter
     if (filter.itemFilter !== 'ALL') {
       list = list.filter(item => item.item_code === filter.itemFilter);
     }
 
-    // Supplier filter
     if (filter.supplierFilter !== 'ALL') {
       list = list.filter(item => item.supplier === filter.supplierFilter);
     }
 
-    // Default sorting (deliveryRank asc, deliveryDays asc, pr_no asc, unit_price asc)
     list.sort((a, b) => {
       if (a.deliveryRank !== b.deliveryRank) {
         return a.deliveryRank - b.deliveryRank;
@@ -134,10 +203,13 @@ export default function App() {
   }, [processedQuotes, filter]);
 
   // Handlers
-  const handleResetDefault = () => {
-    if (confirm('기본 샘플 데이터(80건)로 초기화하시겠습니까? 현재 수정된 내용이 초기화됩니다.')) {
+  const handleResetDefault = async () => {
+    if (confirm('기본 샘플 데이터(80건)로 초기화하시겠습니까?')) {
       setRawQuotes(DEFAULT_QUOTES);
       localStorage.removeItem(STORAGE_KEY);
+      if (isSupabaseConfigured && session) {
+        await saveToSupabaseCumulative(DEFAULT_QUOTES);
+      }
     }
   };
 
@@ -170,27 +242,63 @@ export default function App() {
     document.body.removeChild(link);
   };
 
-  const handleSaveQuote = (saved: QuoteRaw, isEdit: boolean) => {
+  const handleSaveQuote = async (saved: QuoteRaw, isEdit: boolean) => {
+    let updatedList: QuoteRaw[];
     if (isEdit) {
-      setRawQuotes(prev => prev.map(q => q.quote_id === saved.quote_id ? saved : q));
+      updatedList = rawQuotes.map(q => q.quote_id === saved.quote_id ? saved : q);
     } else {
-      setRawQuotes(prev => [saved, ...prev]);
+      updatedList = [saved, ...rawQuotes];
     }
+    setRawQuotes(updatedList);
     setEditingQuote(null);
     setIsAddModalOpen(false);
+
+    // Save to Supabase cumulatively
+    if (isSupabaseConfigured && session) {
+      await saveToSupabaseCumulative([saved]);
+    }
   };
 
-  const handleDeleteQuote = (quoteId: string) => {
+  const handleDeleteQuote = async (quoteId: string) => {
     setRawQuotes(prev => prev.filter(q => q.quote_id !== quoteId));
     setEditingQuote(null);
+
+    if (isSupabaseConfigured && session) {
+      try {
+        await supabase.from('quotes').delete().eq('quote_id', quoteId);
+      } catch (err) {
+        console.error('Error deleting from Supabase:', err);
+      }
+    }
   };
 
-  const handleUpdateStatus = (quoteId: string, newStatus: '견적' | '발주') => {
-    setRawQuotes(prev => prev.map(q => q.quote_id === quoteId ? { ...q, status: newStatus } : q));
+  const handleUpdateStatus = async (quoteId: string, newStatus: '견적' | '발주') => {
+    let targetQuote: QuoteRaw | undefined;
+    setRawQuotes(prev => prev.map(q => {
+      if (q.quote_id === quoteId) {
+        targetQuote = { ...q, status: newStatus };
+        return targetQuote;
+      }
+      return q;
+    }));
+
+    if (isSupabaseConfigured && session && targetQuote) {
+      await saveToSupabaseCumulative([targetQuote]);
+    }
   };
 
-  const handleImportQuotes = (imported: QuoteRaw[]) => {
-    setRawQuotes(imported);
+  // Cumulative import: merges imported quotes into existing quotes by quote_id (upsert)
+  const handleImportQuotes = async (imported: QuoteRaw[]) => {
+    const existingMap = new Map(rawQuotes.map(q => [q.quote_id, q]));
+    imported.forEach(q => {
+      existingMap.set(q.quote_id, q); // cumulative upsert
+    });
+    const merged = Array.from(existingMap.values());
+    setRawQuotes(merged);
+
+    if (isSupabaseConfigured && session) {
+      await saveToSupabaseCumulative(imported);
+    }
   };
 
   const handleDashboardCardSelect = (cardId: string) => {
@@ -209,25 +317,56 @@ export default function App() {
     }
   };
 
+  const handleLogout = async () => {
+    if (isSupabaseConfigured) {
+      await supabase.auth.signOut();
+    }
+    setSession(null);
+  };
+
+  // Loading state
+  if (authLoading) {
+    return (
+      <div className="min-h-screen bg-slate-900 flex items-center justify-center text-white">
+        <div className="flex flex-col items-center space-y-3">
+          <Loader2 className="w-8 h-8 animate-spin text-blue-500" />
+          <p className="text-sm font-medium text-slate-300">사용자 인증 확인 중...</p>
+        </div>
+      </div>
+    );
+  }
+
+  // Require Login if Supabase is configured and user is not logged in
+  if (isSupabaseConfigured && !session) {
+    return <AuthModal onLoginSuccess={() => {}} />;
+  }
+
   return (
     <div className="min-h-screen bg-slate-100 flex flex-col font-sans text-slate-900">
       <Header
         totalCount={processedQuotes.length}
+        userEmail={session?.user?.email || (isSupabaseConfigured ? null : '데모 모드 (Supabase 미연결)')}
         onOpenImport={() => setIsImportModalOpen(true)}
         onOpenAdd={() => setIsAddModalOpen(true)}
         onResetDefault={handleResetDefault}
         onExportCsv={handleExportCsv}
+        onLogout={handleLogout}
       />
 
+      {syncing && (
+        <div className="bg-blue-600 text-white px-4 py-1 text-center text-xs flex items-center justify-center space-x-2">
+          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+          <span>Supabase 데이터베이스와 동기화 중...</span>
+        </div>
+      )}
+
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6">
-        {/* Warning Dashboard Cards */}
         <DashboardCards
           quotes={processedQuotes}
           activeFilter={filter.judgmentFilter}
           onSelectFilter={handleDashboardCardSelect}
         />
 
-        {/* Filter & Search Bar */}
         <FilterBar
           filter={filter}
           onFilterChange={(updated) => setFilter(prev => ({ ...prev, ...updated }))}
@@ -235,7 +374,6 @@ export default function App() {
           uniqueSuppliers={uniqueSuppliers}
         />
 
-        {/* Main Quote Table */}
         <QuoteTable
           quotes={filteredQuotes}
           groupByPr={filter.groupByPr}
@@ -244,7 +382,6 @@ export default function App() {
         />
       </main>
 
-      {/* PR Comparison Detail Modal (S-03) */}
       {selectedPrNo && (
         <PrComparisonModal
           prNo={selectedPrNo}
@@ -254,7 +391,6 @@ export default function App() {
         />
       )}
 
-      {/* Add / Edit Quote Modal (S-04) */}
       {(isAddModalOpen || editingQuote) && (
         <QuoteFormModal
           quoteToEdit={editingQuote}
@@ -264,7 +400,6 @@ export default function App() {
         />
       )}
 
-      {/* Import Modal (S-01) */}
       {isImportModalOpen && (
         <ImportModal
           onClose={() => setIsImportModalOpen(false)}
